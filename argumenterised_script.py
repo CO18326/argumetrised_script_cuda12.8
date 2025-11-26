@@ -77,6 +77,10 @@ def parse_args():
         "--optimiser_offload", type=int,
                          default=0,
                          help="1->optimiser offload")
+    parser.add_argument(
+        "--activation_prefetch", type=int,
+                         default=0,
+                         help="1->activation_prefetch")
 
 
     return parser.parse_args()
@@ -88,8 +92,8 @@ my_lib.prefetch_memory.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
 my_lib.prefetch_memory.restype = ctypes.c_int
 my_lib.pin_memory_hint.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int]
 my_lib.pin_memory_hint.restype = ctypes.c_int
-#my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
-#my_lib.prefetch_memory_batch.restype = ctypes.c_int
+my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
+my_lib.prefetch_memory_batch.restype = ctypes.c_int
 try:
     my_lib.print_first_byte.restype = ctypes.c_int
 except Exception:
@@ -224,6 +228,11 @@ def hook(module, input, output=None, layer_idx=None, total_layers=None):
                     stream_id = 2 + (next_idx % (len(streams) - 2))
                     prefetch_tensor_if_large(w, stream_idx=stream_id)
 
+def hook_only_act(module, input, output=None, layer_idx=None, total_layers=None):
+    for inp in input:
+        if torch.is_tensor(inp):
+            prefetch_tensor_if_large(inp, stream_idx=3)
+
 
 def prefetch_params(module):
     for name, param in module.named_parameters(recurse=False):
@@ -279,12 +288,12 @@ class StepTimeCallback(TrainerCallback):
         with _offload_lock:
             _offloaded_bytes = 0
 
-def register_multi_layer_hooks(model, N=PREFETCH_LAYERS_AHEAD):
+def register_multi_layer_hooks(model,prefetch_weights=False, N=PREFETCH_LAYERS_AHEAD):
     global model_modules
     model_modules = list(model.modules())
     total = len(model_modules)
     for i, module in enumerate(model_modules):
-        module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total))
+        module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else module.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
 
 
 def main():
@@ -302,6 +311,7 @@ def main():
     batch_size = args.batch_size
     optimisation= args.optimisation
     prefetching = args.prefetching
+    activation_prefetch = args.activation_prefetch
 
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -335,7 +345,9 @@ def main():
         ).cuda()
 
     if prefetching:
-        register_multi_layer_hooks(model)
+        register_multi_layer_hooks(model,True)
+    if activation_prefetch:
+        register_multi_layer_hooks(model,False)
     if optimisation==2:
         attach_hooks_by_type(model,args.num_layer_pinned)
 
