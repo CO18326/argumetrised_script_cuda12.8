@@ -1,5 +1,6 @@
 import json
 import sys
+import os
 def read_and_deduplicate(file_path):
     try:
         with open(file_path, 'r') as file:
@@ -134,7 +135,7 @@ for item in filtered_data:
 
 
 print(sum)
-#sys.exit()
+sys.exit()
 if filtered_data:
     sum_weight=0
     sum_input=0
@@ -183,3 +184,18 @@ if filtered_data:
        iter=iter+1
        print(f"done : {iter} out of {len(filtered_data)}")
 print(sum_weight,sum_input,sum_optimizer,sum_gradient)
+
+
+csv_name = "page_fault_summary.csv"
+
+header = "Total Page Faults,Weight faults,Activation faults,Optimizer faults,Gradient faults\n"
+row = f"{sum},{sum_weight},{sum_input},{sum_optimizer},{sum_gradient}\n"
+
+write_header = not os.path.exists(csv_name)
+
+with open(csv_name, "a") as f:
+    if write_header:
+        f.write(header)
+    f.write(row)
+
+print(f"\nSaved/updated CSV: {csv_name}\n")

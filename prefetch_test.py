@@ -28,8 +28,8 @@ my_lib.prefetch_memory.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
 my_lib.prefetch_memory.restype = ctypes.c_int
 my_lib.pin_memory_hint.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int]
 my_lib.pin_memory_hint.restype = ctypes.c_int
-my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
-my_lib.prefetch_memory_batch.restype = ctypes.c_int
+#my_lib.prefetch_memory_batch.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
+#my_lib.prefetch_memory_batch.restype = ctypes.c_int
 try:
     my_lib.print_first_byte.restype = ctypes.c_int
 except Exception:
@@ -104,7 +104,7 @@ def hook(module, input, output=None, layer_idx=None, total_layers=None):
     for inp in input:
         if torch.is_tensor(inp):
             prefetch_tensor_if_large(inp, stream_idx=3)
-
+    
     global model_modules
     if model_modules is None or total_layers is None or layer_idx is None:
         return
@@ -206,9 +206,9 @@ def main():
     #model_name = "facebook/opt-13b"
     seq_len = 1024
     steps = 100
-    batch_size =16
+    batch_size =8
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name,token="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")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
 
@@ -228,9 +228,9 @@ def main():
     dataset = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     #torch._C._cuda_endUvmAllocate()
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,token="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").cuda()
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).cuda()
     #torch._C._cuda_beginUvmAllocate()
-    register_multi_layer_hooks(model, PREFETCH_LAYERS_AHEAD)
+    #register_multi_layer_hooks(model, PREFETCH_LAYERS_AHEAD)
 
     training_args = TrainingArguments(
         output_dir="./results",
@@ -266,7 +266,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         callbacks=[StepTimeCallback()],
-        optimizers=(optimizer, scheduler),
+        #optimizers=(optimizer, scheduler),
     )
 
     # ---------------- Saved Tensor Hook (Activation Offload up to 10GB) ----------------

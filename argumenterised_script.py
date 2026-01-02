@@ -205,6 +205,11 @@ def parse_args():
         "--oversubscription_factor",type=float,
         default=0,help="oversubscription factor you want to enforce"
     )
+
+    parser.add_argument(
+        "--prefetch_weights_only",type=float,
+        default=0,help="prefetch weights only"
+    )
     
     parser.add_argument(
         "--build_csv",type=float,
@@ -402,13 +407,42 @@ def hook_only_act(module, input, output=None, layer_idx=None, total_layers=None)
             prefetch_tensor_if_large(inp, stream_idx=3)
 
 
+
+
+def hook_only_weights(module, input, output=None, layer_idx=None, total_layers=None):
+    global model_modules
+    if model_modules is None or total_layers is None or layer_idx is None:
+        return
+    if layer_idx == 0:
+        end = min(PREFETCH_LAYERS_AHEAD, total_layers)
+        for j in range(end):
+            next_layer = model_modules[j]
+            if hasattr(next_layer, "weight"):
+                w = getattr(next_layer, "weight", None)
+                if w is not None and torch.is_tensor(w):
+                    stream_id = 2 + (j % (len(streams) - 2))
+                    prefetch_tensor_if_large(w, stream_idx=stream_id)
+    else:
+        next_idx = layer_idx + PREFETCH_LAYERS_AHEAD
+        if next_idx < total_layers:
+            next_layer = model_modules[next_idx]
+            if hasattr(next_layer, "weight"):
+                w = getattr(next_layer, "weight", None)
+                if w is not None and torch.is_tensor(w):
+                    stream_id = 2 + (next_idx % (len(streams) - 2))
+                    prefetch_tensor_if_large(w, stream_idx=stream_id)
+
+
+
+
+
 def prefetch_params(module):
     for name, param in module.named_parameters(recurse=False):
         if param is not None and torch.is_tensor(param):
             prefetch_tensor_if_large(param, stream_idx=1)
 
 
-def add_pre_backward_hook(module):
+def add_pre_backward_hook(module,name):
     def fw_hook(mod, inp, out):
         saved_refs = [weakref.ref(x) for x in inp if torch.is_tensor(x)]
         
@@ -424,12 +458,12 @@ def add_pre_backward_hook(module):
             return _hook
 
         if torch.is_tensor(out) and out.requires_grad:
-            #print("check....")
+            #print(name)
             out.register_hook(_make_hook(mod, saved_refs))
         elif isinstance(out, tuple):
             for o in out:
                 if torch.is_tensor(o) and o.requires_grad:
-                    #print("check....")
+                    #print(name)
                     o.register_hook(_make_hook(mod, saved_refs))
 
     module.register_forward_hook(fw_hook)
@@ -447,6 +481,7 @@ class StepTimeCallback(TrainerCallback):
         self.start = None
         self.step_times = []
         self.peak_mems = []
+        self.peak_mems_pinned=[]
     def on_step_begin(self, args, state, control, **kwargs):
         self.start = time.time()
     def on_step_end(self, args, state, control, **kwargs):
@@ -456,7 +491,12 @@ class StepTimeCallback(TrainerCallback):
         self.step_times.append(duration)
         max_mem = torch.cuda.max_memory_reserved() / (1024 ** 2)
         self.peak_mems.append(max_mem)
-        print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB")
+        torch._C._cuda_endUvmAllocate()
+        max_mem_pinned = torch.cuda.max_memory_reserved() / (1024 ** 2)
+        self.peak_mems_pinned.append(max_mem_pinned)
+        torch._C._cuda_beginUvmAllocate()
+        
+        print(f"[Step {state.global_step}] {duration:.3f} sec | Max GPU Mem: {max_mem:.2f} MB | Max Pinned GPU Mem: {max_mem_pinned:.2f} MB" )
         torch.cuda.reset_peak_memory_stats()
         with _offload_lock:
             _offloaded_bytes = 0
@@ -465,8 +505,11 @@ def log_optimizer_state_addresses(optimizer):
     for param_group in optimizer.param_groups:
         for param in param_group['params']:
             state = optimizer.state[param]
+            #print(state.items())
             for key, value in state.items():
-               optimizer_logger.info(f"Optimizer State: {key}, Address: {hex(value.data_ptr())}, Size: {value.nelement() * value.element_size()}")
+                if key=="step":
+                    continue
+                optimizer_logger.info(f"Optimizer State: {key}, Address: {hex(value.data_ptr())}, Size: {value.nelement() * value.element_size()}")
 
 class OptStateLoggerCallback(TrainerCallback):
     def __init__(self):
@@ -491,23 +534,28 @@ class OptStateLoggerCallback(TrainerCallback):
             
 
 
-def register_multi_layer_hooks(model,prefetch_weights=False, N=1):
+def register_multi_layer_hooks(model,prefetch_weights=False, N=1,prefetch_weights_only=False):
     global model_modules
     #model.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else model.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
     model_modules = list(model.modules())
     model_modules=[m for m in model_modules if hasattr(m, "weight") ]
     total = len(model_modules)
     for i, module in enumerate(model_modules):
-        module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total)) if prefetch_weights else module.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
+        if prefetch_weights:
+            module.register_forward_pre_hook(partial(hook, layer_idx=i, total_layers=total))  
         
+        elif prefetch_weights_only:
+            module.register_forward_pre_hook(partial(hook_only_weights, layer_idx=i, total_layers=total))
 
+        else:
+            module.register_forward_pre_hook(partial(hook_only_act, layer_idx=i, total_layers=total))
 def register_backward_hook(model):
     global model_modules
     model_modules = list(model.modules())
     total = len(model_modules)
     #add_pre_backward_hook(model)
-    for i, module in enumerate(model_modules):
-        add_pre_backward_hook(module)
+    for name, module in model.named_modules():
+        add_pre_backward_hook(module,name)
 
 def log_model_weight(model):
     global weight_logger
@@ -520,6 +568,23 @@ def log_model_weight(model):
             weight_logger.info(f"Address: {hex(data_ptr)}, Size: {size_in_bytes}")
 
         
+
+def build_log_dir_name(args):
+    parts = []
+    for k, v in vars(args).items():
+        if k == "oversubscription_factor":
+            continue
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple, dict)):
+            v = str(v).replace(" ", "_").replace("/", "-")
+        else:
+            v = str(v).replace(" ", "_").replace("/", "-")
+
+        parts.append(f"{v}")
+        
+    filename = "-".join(parts)
+    return filename
 
 
 def main():
@@ -544,12 +609,13 @@ def main():
     backward_prefetch=args.backward_prefetch
 
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name,token="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")
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
 
     if logging:
-        create_loggers()
+        dir_name="page_faults_"+build_log_dir_name(args)
+        create_loggers(dir_name)
     
     def tokenize_fn(examples):
         model_inputs = tokenizer(
@@ -569,12 +635,12 @@ def main():
     if args.weight_pinned:
         torch._C._cuda_endUvmAllocate()
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,
+            model_name, torch_dtype=torch.bfloat16,token="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"
         ).cuda(0)
         torch._C._cuda_beginUvmAllocate()
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,
+            model_name, torch_dtype=torch.bfloat16,token="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"
         ).cuda(0)
     
     #print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
@@ -582,6 +648,8 @@ def main():
         log_model_weight(model)
     if prefetching:
         register_multi_layer_hooks(model,True,PREFETCH_LAYERS_AHEAD)
+    if args.prefetch_weights_only:
+        register_multi_layer_hooks(model,False,PREFETCH_LAYERS_AHEAD,True)
     if backward_prefetch:
         register_backward_hook(model)
     if activation_prefetch:
@@ -590,7 +658,6 @@ def main():
         attach_hooks_by_type(model,args.num_layer_pinned)
 
     callbacks=[StepTimeCallback(),OptStateLoggerCallback() ] if logging else [StepTimeCallback()]
-    
     training_args = TrainingArguments(
         output_dir="./results",
         per_device_train_batch_size=batch_size,
@@ -621,24 +688,27 @@ def main():
 
     avg_step = sum(cb.step_times) / len(cb.step_times)
     peak_mem = max(cb.peak_mems)   # MB
+    peak_mems_pinned = max(cb.peak_mems_pinned)
 
     free_memory, total_memory = torch.cuda.memory.mem_get_info()
 
-    achieved_oversubscription_factor=(peak_mem*1024*1024/total_memory)
+    achieved_oversubscription_factor=((peak_mem+peak_mems_pinned)*1024*1024/total_memory)
 
     print(f"ACHIEVED OVERSUBSCRIPTION FACTOR {achieved_oversubscription_factor:.2f}")
         
     final_oversubscription=achieved_oversubscription_factor
+    extra_memory_needed=0
     if args.oversubscription_factor and round(achieved_oversubscription_factor,2) > args.oversubscription_factor :
         print("Given oversubscription factor can not be achieved") 
     elif args.oversubscription_factor and round(achieved_oversubscription_factor,2) < args.oversubscription_factor:
 
-        needed_memory=(total_memory*args.oversubscription_factor)/(1024**3)
-        extra_memory_needed= int(needed_memory - peak_mem/(1024))
+        needed_memory=((peak_mem+peak_mems_pinned)*(1024**2)/args.oversubscription_factor)
+        extra_memory_needed= int((total_memory - needed_memory)/(1024**3))
+        print("EXTRA MEMORY NEEDED",extra_memory_needed)
         my_lib.cuda_malloc(extra_memory_needed)
         final_oversubscription=args.oversubscription_factor
 
-
+    final_gpu_mem= (total_memory/(1024**2) if not extra_memory_needed else  needed_memory/(1024**2))
 
 
         
@@ -649,7 +719,7 @@ def main():
     grad_b  = pred["grad_bytes"]
     optim_b = pred["optim_bytes"]
 
-    activation_b = (peak_mem * 1024**2) - (param_b + grad_b + optim_b)
+    activation_b = ((peak_mem+peak_mems_pinned) * 1024**2) - (param_b + grad_b + optim_b)
     activation_b = max(activation_b, 0)
 
     print("\n================ WARMUP SUMMARY ================")
@@ -660,12 +730,13 @@ def main():
     print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
     print(f"Activation Memory: {human_readable_mb(activation_b)}")
     print("================================================\n")
-
+    
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
     callbacks[0].step_times=[]
     callbacks[0].peak_mems=[]
+    callbacks[0].peak_mems_pinned=[]
     
     training_args = TrainingArguments(
         output_dir="./results",
@@ -700,7 +771,7 @@ def main():
             tokenizer=tokenizer,
             data_collator=data_collator,
             callbacks=callbacks,
-            optimizers=(optimizer, scheduler),
+            optimizers=(optimizer, None),
         )
         
 
@@ -807,21 +878,28 @@ def main():
     cb = callbacks[0]
 
     avg_step = sum(cb.step_times) / len(cb.step_times)
-    peak_mem = max(cb.peak_mems)   # MB
+    peak_mem = max(cb.peak_mems)
+    peak_mems_pinned = max(cb.peak_mems_pinned)   # MB
 
         # Model memory breakdown using existing function
     pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
+
+    #final_oversubscription=0
+    #final_gpu_mem=0
+
+
 
     param_b = pred["param_bytes"]
     grad_b  = pred["grad_bytes"]
     optim_b = pred["optim_bytes"]
 
-    activation_b = (peak_mem * 1024**2) - (param_b + grad_b + optim_b)
+    activation_b = ((peak_mem+peak_mems_pinned) * 1024**2) - (param_b + grad_b + optim_b)
     activation_b = max(activation_b, 0)
 
     print("\n================ FINAL SUMMARY ================")
     print(f"Average Step Time: {avg_step:.4f} sec")
     print(f"Peak GPU Memory  : {peak_mem:.2f} MB")
+    print(f"Pinned Peak GPU Memory  : {peak_mems_pinned:.2f} MB")
     print(f"Weights Memory   : {human_readable_mb(param_b)}")
     print(f"Gradients Memory : {human_readable_mb(grad_b)}")
     print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
@@ -831,10 +909,10 @@ def main():
 
     if args.build_csv :
     
-        csv_name = build_csv_name(args)
+        csv_name = f"/modelops/priyanka/runtime_csvs/{build_csv_name(args)}"
 
-        header = "avg_step_time,peak_gpu_mem,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor\n"
-        row = f"{avg_step:.4f},{peak_mem:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f}\n"
+        header = "avg_step_time,peak_gpu_mem,peak_gpu_mem_pinned,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor,available_gpu_mem\n"
+        row = f"{avg_step:.4f},{peak_mem:.2f},{peak_mems_pinned:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f},{final_gpu_mem:.2f}\n"
 
         write_header = not os.path.exists(csv_name)
 
