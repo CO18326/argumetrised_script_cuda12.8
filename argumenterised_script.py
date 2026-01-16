@@ -216,6 +216,10 @@ def parse_args():
         default=0,help="building the csv"
     )
 
+    parser.add_argument("--no_warmup",type=int,default=0,help="warmup")
+
+    parser.add_argument("--nvtx_inject",type=int,default=0,help="NVTX Inject")
+
 
     return parser.parse_args()
 
@@ -477,11 +481,27 @@ def _size_in_bytes(tensor):
 
 
 class StepTimeCallback(TrainerCallback):
-    def __init__(self):
+    def __init__(self,is_nvtx=False):
         self.start = None
         self.step_times = []
         self.peak_mems = []
         self.peak_mems_pinned=[]
+        self.is_nvtx=is_nvtx
+    
+    
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        if is_nvtx:
+            torch.cuda.nvtx.range_pop()
+
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        if is_nvtx:
+            torch.cuda.nvtx.range_push("Optimizer Step")
+
+
+
+    
+    
     def on_step_begin(self, args, state, control, **kwargs):
         self.start = time.time()
     def on_step_end(self, args, state, control, **kwargs):
@@ -609,7 +629,7 @@ def main():
     backward_prefetch=args.backward_prefetch
 
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name,token="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")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
 
@@ -635,12 +655,12 @@ def main():
     if args.weight_pinned:
         torch._C._cuda_endUvmAllocate()
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,token="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"
+            model_name, torch_dtype=torch.bfloat16
         ).cuda(0)
         torch._C._cuda_beginUvmAllocate()
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16,token="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"
+            model_name, torch_dtype=torch.bfloat16
         ).cuda(0)
     
     #print_memory_prediction(model, batch_size, seq_len, bf16=True, safety=1.5)
@@ -656,81 +676,85 @@ def main():
         register_multi_layer_hooks(model,False)
     if optimisation==2:
         attach_hooks_by_type(model,args.num_layer_pinned)
-
-    callbacks=[StepTimeCallback(),OptStateLoggerCallback() ] if logging else [StepTimeCallback()]
-    training_args = TrainingArguments(
-        output_dir="./results",
-        per_device_train_batch_size=batch_size,
-        num_train_epochs=1,
-        max_steps=2,
-        bf16=True,
-        logging_dir="./logs",
-        logging_steps=1,
-        save_strategy="no",
-        report_to="none",
-    )
-
     
-    trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=dataset,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            callbacks=[callbacks[0]],
-        
+    
+    is_nvtx=True if args.nvtx_inject else False
+    callbacks=[StepTimeCallback(is_nvtx),OptStateLoggerCallback() ] if logging else [StepTimeCallback(is_nvtx)]
+    
+    
+    if args.no_warmup==0:
+        training_args = TrainingArguments(
+            output_dir="./results",
+            per_device_train_batch_size=batch_size,
+            num_train_epochs=1,
+            max_steps=2,
+            bf16=True,
+            logging_dir="./logs",
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
         )
-    
-    trainer.train()
-
-
-    cb = callbacks[0]
-
-    avg_step = sum(cb.step_times) / len(cb.step_times)
-    peak_mem = max(cb.peak_mems)   # MB
-    peak_mems_pinned = max(cb.peak_mems_pinned)
-
-    free_memory, total_memory = torch.cuda.memory.mem_get_info()
-
-    achieved_oversubscription_factor=((peak_mem+peak_mems_pinned)*1024*1024/total_memory)
-
-    print(f"ACHIEVED OVERSUBSCRIPTION FACTOR {achieved_oversubscription_factor:.2f}")
-        
-    final_oversubscription=achieved_oversubscription_factor
-    extra_memory_needed=0
-    if args.oversubscription_factor and round(achieved_oversubscription_factor,2) > args.oversubscription_factor :
-        print("Given oversubscription factor can not be achieved") 
-    elif args.oversubscription_factor and round(achieved_oversubscription_factor,2) < args.oversubscription_factor:
-
-        needed_memory=((peak_mem+peak_mems_pinned)*(1024**2)/args.oversubscription_factor)
-        extra_memory_needed= int((total_memory - needed_memory)/(1024**3))
-        print("EXTRA MEMORY NEEDED",extra_memory_needed)
-        my_lib.cuda_malloc(extra_memory_needed)
-        final_oversubscription=args.oversubscription_factor
-
-    final_gpu_mem= (total_memory/(1024**2) if not extra_memory_needed else  needed_memory/(1024**2))
-
 
         
-        # Model memory breakdown using existing function
-    pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
+        trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                tokenizer=tokenizer,
+                data_collator=data_collator,
+                callbacks=[callbacks[0]],
+            
+            )
+        
+        trainer.train()
 
-    param_b = pred["param_bytes"]
-    grad_b  = pred["grad_bytes"]
-    optim_b = pred["optim_bytes"]
 
-    activation_b = ((peak_mem+peak_mems_pinned) * 1024**2) - (param_b + grad_b + optim_b)
-    activation_b = max(activation_b, 0)
+        cb = callbacks[0]
 
-    print("\n================ WARMUP SUMMARY ================")
-    print(f"Average Step Time: {avg_step:.4f} sec")
-    print(f"Peak GPU Memory  : {peak_mem:.2f} MB")
-    print(f"Weights Memory   : {human_readable_mb(param_b)}")
-    print(f"Gradients Memory : {human_readable_mb(grad_b)}")
-    print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
-    print(f"Activation Memory: {human_readable_mb(activation_b)}")
-    print("================================================\n")
-    
+        avg_step = sum(cb.step_times) / len(cb.step_times)
+        peak_mem = max(cb.peak_mems)   # MB
+        peak_mems_pinned = max(cb.peak_mems_pinned)
+
+        free_memory, total_memory = torch.cuda.memory.mem_get_info()
+
+        achieved_oversubscription_factor=((peak_mem+peak_mems_pinned)*1024*1024/total_memory)
+
+        print(f"ACHIEVED OVERSUBSCRIPTION FACTOR {achieved_oversubscription_factor:.2f}")
+            
+        final_oversubscription=achieved_oversubscription_factor
+        extra_memory_needed=0
+        if args.oversubscription_factor and round(achieved_oversubscription_factor,2) > args.oversubscription_factor :
+            print("Given oversubscription factor can not be achieved") 
+        elif args.oversubscription_factor and round(achieved_oversubscription_factor,2) < args.oversubscription_factor:
+
+            needed_memory=((peak_mem+peak_mems_pinned)*(1024**2)/args.oversubscription_factor)
+            extra_memory_needed= int((total_memory - needed_memory)/(1024**3))
+            print("EXTRA MEMORY NEEDED",extra_memory_needed)
+            my_lib.cuda_malloc(extra_memory_needed)
+            final_oversubscription=args.oversubscription_factor
+
+        final_gpu_mem= (total_memory/(1024**2) if not extra_memory_needed else  needed_memory/(1024**2))
+
+
+            
+            # Model memory breakdown using existing function
+        pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
+
+        param_b = pred["param_bytes"]
+        grad_b  = pred["grad_bytes"]
+        optim_b = pred["optim_bytes"]
+
+        activation_b = ((peak_mem+peak_mems_pinned) * 1024**2) - (param_b + grad_b + optim_b)
+        activation_b = max(activation_b, 0)
+
+        print("\n================ WARMUP SUMMARY ================")
+        print(f"Average Step Time: {avg_step:.4f} sec")
+        print(f"Peak GPU Memory  : {peak_mem:.2f} MB")
+        print(f"Weights Memory   : {human_readable_mb(param_b)}")
+        print(f"Gradients Memory : {human_readable_mb(grad_b)}")
+        print(f"Optimizer Memory : {human_readable_mb(optim_b)}")
+        print(f"Activation Memory: {human_readable_mb(activation_b)}")
+        print("================================================\n")
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
@@ -848,7 +872,7 @@ def main():
     def build_csv_name(args):
         parts = []
         for k, v in vars(args).items():
-            if k == "oversubscription_factor":
+            if k == "oversubscription_factor" or k=="no_warmup" or k=="nvtx_inject":
                 continue
             if v is None:
                 continue
@@ -883,9 +907,9 @@ def main():
 
         # Model memory breakdown using existing function
     pred = predict_peak_memory(model, batch_size, seq_len, bf16=True, extra_safety=1.0)
-
-    #final_oversubscription=0
-    #final_gpu_mem=0
+    if args.no_warmup==1:
+        final_oversubscription=0
+        final_gpu_mem=0
 
 
 
@@ -909,7 +933,7 @@ def main():
 
     if args.build_csv :
     
-        csv_name = f"/modelops/priyanka/runtime_csvs/{build_csv_name(args)}"
+        csv_name = f"{build_csv_name(args)}"
 
         header = "avg_step_time,peak_gpu_mem,peak_gpu_mem_pinned,weights_mem,grads_mem,opt_mem,activation_mem,oversub_factor,available_gpu_mem\n"
         row = f"{avg_step:.4f},{peak_mem:.2f},{peak_mems_pinned:.2f},{human_readable_mb(param_b)},{human_readable_mb(grad_b)},{human_readable_mb(optim_b)},{human_readable_mb(activation_b)},{final_oversubscription:.2f},{final_gpu_mem:.2f}\n"
