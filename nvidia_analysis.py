@@ -1,5 +1,7 @@
 import sqlite3
 import sys
+import os
+import csv
 
 def ns_to_ms(ns):
     return ns / 1e6
@@ -137,6 +139,37 @@ def main(sqlite_file):
     print(f"Memcpy hidden by GPU  : {memcpy_hidden_by_gpu_pct:.2f} %")
 
     conn.close()
+
+    base_name = os.path.basename(sqlite_file)
+    name_no_ext = os.path.splitext(base_name)[0]
+    csv_file = f"nsys_analysis_{name_no_ext}.csv"
+    file_exists = os.path.isfile(csv_file)
+
+    row = {
+    "gpu_compute_ms": ns_to_ms(gpu_compute_ns),
+    "gpu_memcpy_ms": ns_to_ms(total_memcpy_ns),
+    "cpu_compute_ms": ns_to_ms(cpu_compute_ns),
+
+    "memcpy_htod_ms": ns_to_ms(memcpy_by_kind.get(1, 0)),
+    "memcpy_dtoh_ms": ns_to_ms(memcpy_by_kind.get(2, 0)),
+    "memcpy_dtod_ms": ns_to_ms(memcpy_by_kind.get(3, 0)),
+    "memcpy_p2p_ms":  ns_to_ms(memcpy_by_kind.get(8, 0)),
+    "memcpy_unified_htod_ms":  ns_to_ms(memcpy_by_kind.get(11, 0)),
+    "memcpy_unified_dtoh_ms":  ns_to_ms(memcpy_by_kind.get(12, 0)),
+
+    "cpu_gpu_overlap_ms": ns_to_ms(cpu_gpu_overlap_ns),
+    "gpu_memcpy_overlap_ms": ns_to_ms(gpu_memcpy_overlap_ns),
+
+    "gpu_hidden_by_cpu_pct": gpu_hidden_by_cpu_pct,
+    "cpu_overlapped_with_gpu_pct": cpu_overlapped_with_gpu_pct,
+    "memcpy_hidden_by_gpu_pct": memcpy_hidden_by_gpu_pct,
+     }
+
+    with open(csv_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 if __name__ == "__main__":
 
