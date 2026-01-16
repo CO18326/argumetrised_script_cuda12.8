@@ -6,7 +6,7 @@ BATCH_LIST = [8]
 
 def run_once(python_script, fixed_args, batch, seq,profile_out):
     """Run training script once with batch + seq."""
-    cmd = ["/dev/shm/nsight-systems-2025.6.1/bin/nsys","profile","--force-overwrite","true","--cuda-um-gpu-page-faults","true" ,"--cuda-um-cpu-page-faults","true","--output",profile_out,
+    cmd = ["/dev/shm/nsight-systems-2025.6.1/bin/nsys","profile","--force-overwrite","true","--cuda-um-gpu-page-faults","true" ,"--cuda-um-cpu-page-faults","true","--trace","cuda,nvtx,osrt","--cuda-memory-usage","true","--output",profile_out,
         "python", python_script,
         "--batch_size", str(batch),
         "--seq_len", str(seq),
@@ -20,6 +20,12 @@ def run_once(python_script, fixed_args, batch, seq,profile_out):
     subprocess.run(cmd, check=False)
     json_cmd=["/dev/shm/nsight-systems-2025.6.1/bin/nsys", 'stats', '--format','json','--report','um_sum','--output',f'{profile_out}', f'{profile_out}.nsys-rep']
     subprocess.run(json_cmd, check=False)
+    
+    cmd=["/dev/shm/nsight-systems-2025.6.1/bin/nsys","export","--type","sqlite","-o",f"{profile_out}",f'{profile_out}.nsys-rep']
+    subprocess.run(cmd, check=False)
+
+
+    
 
 def main():
     parser = argparse.ArgumentParser()
