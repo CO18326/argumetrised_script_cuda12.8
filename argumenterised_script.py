@@ -685,7 +685,7 @@ def main():
         attach_hooks_by_type(model,args.num_layer_pinned)
     
     
-    is_nvtx=True if args.nvtx_inject else False
+    is_nvtx=True if args.nvtx_inject and args.optimiser_offload else False
     callbacks=[StepTimeCallback(is_nvtx),OptStateLoggerCallback() ] if logging else [StepTimeCallback(is_nvtx)]
     
     
