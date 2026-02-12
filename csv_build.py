@@ -70,10 +70,10 @@ for filename in os.listdir(CSV_FOLDER):
 
         fixed_tail = parts[-15:]
 
-        if model_name != "microsoft-Phi-3.5-mini-instruct":
+        #if model_name != "microsoft-Phi-3.5-mini-instruct":
             #print(model_name)
             #print("check")
-            continue
+        #    continue
         fixed_tail.append("1.0")
         fixed_tail[-2]="0"
         metadata = dict(zip(
@@ -81,8 +81,8 @@ for filename in os.listdir(CSV_FOLDER):
             [model_name] + fixed_tail
         ))
     else:
-        model_name = "-".join(parts[:-16])
-        fixed_tail = parts[-16:]
+        model_name = "-".join(parts[:-17])
+        fixed_tail = parts[-17:]
         #if model_name != "microsoft-Phi-3.5-mini-instruct":
             #print(model_name)
             #print("check")
