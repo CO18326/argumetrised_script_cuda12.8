@@ -297,7 +297,7 @@ def choose_optimisation(
 ):
     remaining_gpu_mem = peak_mem-gpu_mem
 
-    if remaining_gpu_mem <= 0.5 * optimizer_mem:
+    if remaining_gpu_mem <= 0.4 * optimizer_mem:
         return "Vanilla"
 
     print(cpu_ram,swapiness,peak_mem,gpu_mem,remaining_gpu_mem)
